@@ -21,6 +21,7 @@ import re
 import struct
 import itertools
 import pandas as pd
+from tflite2tensorflow.mediapipeCustomOp import Landmarks2TransformMatrix, TransformTensorBilinear, TransformLandmarks
 
 class Color:
     BLACK          = '\033[30m'
@@ -415,7 +416,10 @@ def make_graph(
     replace_prelu_and_minmax,
     optimizing_for_edgetpu_flg,
     optimizing_for_openvino_and_myriad,
-    rigorous_optimization_for_myriad):
+    rigorous_optimization_for_myriad,
+    optimizing_for_coreml,
+    optimizing_barracuda,
+):
 
     import tensorflow.compat.v1 as tf
     tf.get_logger().setLevel('INFO')
@@ -495,7 +499,7 @@ def make_graph(
 
     def backward_quantization(op_detail, op):
         if not 'quantization' in op_detail or \
-            (input_detail['quantization'][0] == 0.0 and input_detail['quantization'][1] == 0):
+            (op_detail['quantization'][0] == 0.0 and op_detail['quantization'][1] == 0):
             return op
         else:
             scales = np.asarray(op_detail['quantization'][0], dtype=np.float32)
@@ -1443,6 +1447,12 @@ def make_graph(
                                 align_corners=True,
                                 half_pixel_centers=half_pixel_centers
                             )
+                    elif optimizing_for_coreml:
+                        return tf.image.resize_bilinear(
+                            x,
+                            (size_height, size_width),
+                            align_corners=True
+                        )
                     else:
                         return tfv2.image.resize(
                             x,
@@ -1496,6 +1506,8 @@ def make_graph(
                                 align_corners=True,
                                 half_pixel_centers=half_pixel_centers
                             )
+                    elif optimizing_for_coreml:
+                        return tf.image.resize_nearest_neighbor(x, (size_height, size_width))
                     else:
                         return tfv2.image.resize(
                             x,
@@ -2261,16 +2273,63 @@ def make_graph(
             except:
                 input_tensor2 = interpreter.get_tensor(positions_detail['index'])
                 input_tensor2 = backward_quantization(positions_detail, input_tensor2)
-
             options = op['builtin_options']
             output_type = cast_type_tf[options['output_type']]
             output_detail = interpreter._get_tensor_details(op['outputs'][0])
-            output_tensor = tf.math.argmax(
-                input_tensor1,
-                axis=input_tensor2,
-                output_type=output_type,
-                name=get_op_name(output_detail['name'])
-            )
+
+            def _nnapi_scalar(value, dtype):
+                return tf.constant(value, dtype=dtype, shape=(1,))
+
+            def _alternative_argmax(
+                input_tensor,
+                axis=-1,
+                output_type = tf.dtypes.float32,
+                name = None,
+                keepdims = False,
+                epsilon = None
+            ):
+                safe_axis = axis
+                if safe_axis < 0:
+                    safe_axis = len(input_tensor.shape) + safe_axis
+                reduction_size = input_tensor.shape[axis]
+                axis_max = tf.math.reduce_max(input_tensor, axis=axis, keepdims=True)
+                zero_if_max = tf.subtract(axis_max, input_tensor)
+                eps = epsilon if epsilon else 1e-6
+                if input_tensor.dtype.is_floating:
+                    zero_if_max_else_eps = tf.math.minimum(_nnapi_scalar(eps, input_tensor.dtype), zero_if_max)
+                    zero_if_max_else_one = zero_if_max_else_eps * _nnapi_scalar(1 / eps, input_tensor.dtype)
+                elif input_tensor.dtype.is_integer:
+                    zero_if_max_else_one = tf.math.minimum(_nnapi_scalar(1, input_tensor.dtype), zero_if_max)
+                else:
+                    raise ValueError('Please specify epsilon for unknown input data type')
+
+                zero_if_max_else_one = tf.cast(zero_if_max_else_one, dtype=output_type)
+                zero_if_max_else_one = zero_if_max_else_one
+                one_if_max_else_zero = tf.math.subtract(_nnapi_scalar(1, output_type), zero_if_max_else_one)
+                rev_index = tf.range(reduction_size, 0, -1, dtype=output_type)
+                for index in range(safe_axis + 1, len(input_tensor.shape)):
+                    rev_index = tf.expand_dims(rev_index, axis=index - safe_axis)
+                rev_index = rev_index
+                rev_index_if_max_else_zero = tf.math.multiply(one_if_max_else_zero, rev_index)
+                reverse_argmax = tf.math.reduce_max(rev_index_if_max_else_zero, axis=axis, keepdims=keepdims, name=name)
+                return tf.cast(tf.math.subtract(_nnapi_scalar(reduction_size, output_type), reverse_argmax, name=name), dtype=tf.int32)
+
+            output_tensor = None
+            if not optimizing_for_edgetpu_flg:
+                output_tensor = tf.math.argmax(
+                    input_tensor1,
+                    axis=input_tensor2,
+                    output_type=output_type,
+                    name=get_op_name(output_detail['name'])
+                )
+            else:
+                output_tensor = _alternative_argmax(
+                    input_tensor=input_tensor1,
+                    axis=input_tensor2,
+                    output_type=tf.float32,
+                    name=get_op_name(output_detail['name'])
+                )
+
             tensors[output_detail['index']] = output_tensor
 
         elif op_type == 'EXP':
@@ -3397,11 +3456,45 @@ def make_graph(
             except:
                 input_tensor2 = interpreter.get_tensor(positions_detail['index'])
             output_detail = interpreter._get_tensor_details(op['outputs'][0])
-            output_tensor = tf.gather_nd(
-                input_tensor1,
-                input_tensor2,
-                name=get_op_name(output_detail['name'])
-            )
+
+            def barracuda_gather_nd(params, indices):
+                if len(indices.shape) == 4 and indices.shape[0] == 1:
+                    indices = indices[0]
+                elif len(indices.shape) == 3:
+                    pass
+                else:
+                    print(f'{Color.RED}ERROR:{Color.RESET} gather_nd when optimizing_barracuda is enabled must have 4 dimensions and batch size = 1 or 3 dimensions.')
+                    print(f'{Color.RED}ERROR:{Color.RESET} params.shape: {params.shape}, indices.shape: {indices.shape}')
+                    sys.exit(-1)
+                if len(params.shape) == 4 and params.shape[0] == 1:
+                    params = params[0]
+                elif len(params.shape) == 3:
+                    pass
+                else:
+                    print(f'{Color.RED}ERROR:{Color.RESET} gather_nd when optimizing_barracuda is enabled must have 4 dimensions and batch size = 1 or 3 dimensions.')
+                    print(f'{Color.RED}ERROR:{Color.RESET} params.shape: {params.shape}, indices.shape: {indices.shape}')
+                    sys.exit(-1)
+                idx_shape = indices.shape
+                params_shape = params.shape
+                idx_dims = idx_shape[-1]
+                gather_shape = params_shape[idx_dims:]
+                params_flat = tf.reshape(params, tf.concat([[-1], gather_shape], axis=0))
+                axis_step = tf.math.cumprod(params_shape[:idx_dims], exclusive=True, reverse=True)
+                mul = tf.math.multiply(indices, axis_step)
+                indices_flat = tf.reduce_sum(mul, axis=-1)
+                result_flat = tf.gather(params_flat, indices_flat)
+                return tf.expand_dims(tf.reshape(result_flat, tf.concat([idx_shape[:-1], gather_shape], axis=0)), axis=0)
+
+            optimaization_for_myriad = (optimizing_for_openvino_and_myriad and rigorous_optimization_for_myriad)
+            if not optimizing_barracuda and not optimaization_for_myriad:
+                output_tensor = tf.gather_nd(
+                    input_tensor1,
+                    input_tensor2,
+                    name=get_op_name(output_detail['name'])
+                )
+            else:
+                output_tensor = barracuda_gather_nd(input_tensor1, input_tensor2)
+
             tensors[output_detail['index']] = output_tensor
 
         elif op_type == 'COS':
@@ -3510,7 +3603,7 @@ def make_graph(
             body_subgraph_index = options['body_subgraph_index'] - 1
 
             output_detail = interpreter._get_tensor_details(op['outputs'][0])
-            if input_tensor4:
+            if input_tensor4 is not None:
                 output_tensor = tf.while_loop(
                     input_list[cond_subgraph_index],
                     input_list[body_subgraph_index],
@@ -5023,6 +5116,32 @@ def make_graph(
                     )
                     tensors[output_detail['index']] = output_tensor
 
+                # MediaPipe v0.8.9
+                elif custom_op_type == 'Landmarks2TransformMatrix':
+                    options = op['custom_options']
+                    custom_options = read_flexbuffer(np.array(options, dtype=np.uint8).tobytes())
+                    output_detail = interpreter._get_tensor_details(op['outputs'][0])
+                    tensors[output_detail['index']] = Landmarks2TransformMatrix(op, custom_options, tensors, interpreter)
+
+                elif custom_op_type == 'TransformTensorBilinear':
+                    options = op['custom_options']
+                    custom_options = read_flexbuffer(np.array(options, dtype=np.uint8).tobytes())
+                    output_detail = interpreter._get_tensor_details(op['outputs'][0])
+                    optimaization_for_myriad = (optimizing_for_openvino_and_myriad and rigorous_optimization_for_myriad)
+                    tensors[output_detail['index']] = TransformTensorBilinear(
+                        op,
+                        custom_options,
+                        tensors,
+                        interpreter,
+                        optimizing_barracuda,
+                        optimaization_for_myriad,
+                    )
+
+                elif custom_op_type == 'TransformLandmarks':
+                    custom_options = None
+                    output_detail = interpreter._get_tensor_details(op['outputs'][0])
+                    tensors[output_detail['index']] = TransformLandmarks(op, custom_options, tensors, interpreter)
+
                 elif custom_op_type == 'FlexRFFT':
                     input_tensor1 = None
                     try:
@@ -5547,11 +5666,14 @@ def main():
     parser.add_argument('--output_tftrt_float32', action='store_true', help='tftrt float32 model output switch')
     parser.add_argument('--output_tftrt_float16', action='store_true', help='tftrt float16 model output switch')
     parser.add_argument('--output_coreml', action='store_true', help='coreml model output switch')
+    parser.add_argument('--optimizing_for_coreml', action='store_true', help='Optimizing graph for coreml')
     parser.add_argument('--output_edgetpu', action='store_true', help='edgetpu model output switch')
     parser.add_argument('--edgetpu_compiler_timeout', type=int, default=3600, help='edgetpu_compiler timeout for one compilation process in seconds. Default: 3600')
     parser.add_argument('--edgetpu_num_segments', type=int, default=1, help='Partition the model into [num_segments] segments. Default: 1 (no partition)')
     parser.add_argument('--output_onnx', action='store_true', help='onnx model output switch')
     parser.add_argument('--onnx_opset', type=int, default=13, help='onnx opset version number')
+    parser.add_argument('--onnx_extra_opset', type=str, default='', help='The name of the onnx extra_opset to enable. Default: \'\'. "com.microsoft:1" or "ai.onnx.contrib:1" or "ai.onnx.ml:1"')
+    parser.add_argument('--disable_onnx_nchw_conversion', action='store_true', help='Disable onnx NCHW conversion.')
     parser.add_argument('--disable_onnx_optimization', action='store_true', help='Disable onnx optimization.')
     parser.add_argument('--output_openvino_and_myriad', action='store_true', help='openvino model and myriad inference engine blob output switch')
     parser.add_argument('--vpu_number_of_shaves', type=int, default=4, help='vpu number of shaves. Default: 4')
@@ -5559,9 +5681,11 @@ def main():
     parser.add_argument('--optimizing_for_openvino_and_myriad', action='store_true', help='Optimizing graph for openvino/myriad')
     parser.add_argument('--rigorous_optimization_for_myriad', action='store_true', help='Replace operations that are not supported by myriad with operations that are as feasible as possible.')
     parser.add_argument('--replace_swish_and_hardswish', action='store_true', help='Replace swish and hard-swish with each other')
-    parser.add_argument('--optimizing_hardswish_for_edgetpu', action='store_true', help='Optimizing hardswish for edgetpu')
+    parser.add_argument('--optimizing_for_edgetpu', action='store_true', help='Optimizing for edgetpu')
     parser.add_argument('--replace_prelu_and_minmax', action='store_true', help='Replace prelu and minimum/maximum with each other')
     parser.add_argument('--disable_experimental_new_quantizer', action='store_true', help='Disable MLIR\'s new quantization feature during INT8 quantization in TensorFlowLite.')
+    parser.add_argument('--disable_per_channel', action='store_true', help='Disable per-channel quantization for tflite')
+    parser.add_argument('--optimizing_barracuda', action='store_true', help='Generates ONNX by replacing Barracuda\'s unsupported layers with standard layers.')
     parser.add_argument('--locationids_of_the_terminating_output', type=str, default='', help='A comma-separated list of location IDs to be used as output layers. Default: \'\'')
     args = parser.parse_args()
 
@@ -5593,11 +5717,14 @@ def main():
     output_tftrt_float32 = args.output_tftrt_float32
     output_tftrt_float16 = args.output_tftrt_float16
     output_coreml = args.output_coreml
+    optimizing_for_coreml = args.optimizing_for_coreml
     output_edgetpu = args.output_edgetpu
     edgetpu_compiler_timeout = args.edgetpu_compiler_timeout
     edgetpu_num_segments = args.edgetpu_num_segments
     output_onnx = args.output_onnx
     onnx_opset = args.onnx_opset
+    onnx_extra_opset = args.onnx_extra_opset
+    use_onnx_nchw_conversion = not args.disable_onnx_nchw_conversion
     use_onnx_optimization = not args.disable_onnx_optimization
     output_openvino_and_myriad = args.output_openvino_and_myriad
     vpu_number_of_shaves = args.vpu_number_of_shaves
@@ -5605,9 +5732,11 @@ def main():
     optimizing_for_openvino_and_myriad = args.optimizing_for_openvino_and_myriad
     rigorous_optimization_for_myriad = args.rigorous_optimization_for_myriad
     replace_swish_and_hardswish = args.replace_swish_and_hardswish
-    optimizing_hardswish_for_edgetpu = args.optimizing_hardswish_for_edgetpu
+    optimizing_for_edgetpu = args.optimizing_for_edgetpu
     replace_prelu_and_minmax = args.replace_prelu_and_minmax
     use_experimental_new_quantizer = not args.disable_experimental_new_quantizer
+    use_per_channel = not args.disable_per_channel
+    optimizing_barracuda = args.optimizing_barracuda
     locationids_of_the_terminating_output_tmp = args.locationids_of_the_terminating_output
     locationids_of_the_terminating_output = None
     if locationids_of_the_terminating_output_tmp:
@@ -5622,7 +5751,7 @@ def main():
         output_full_integer_quant_tflite = True
         optimizing_for_edgetpu_flg = True
 
-    if optimizing_hardswish_for_edgetpu:
+    if optimizing_for_edgetpu:
         optimizing_for_edgetpu_flg = True
 
     from pkg_resources import working_set
@@ -5707,8 +5836,16 @@ def main():
         print('[Group.2] output_no_quant_float32_tflite, output_weight_quant_tflite, output_float16_quant_tflite, output_integer_quant_tflite, output_full_integer_quant_tflite, output_tfjs, output_tftrt_float32, output_tftrt_float16, output_coreml, output_edgetpu, output_onnx, output_openvino_and_myriad')
         sys.exit(-1)
 
-    if optimizing_for_openvino_and_myriad and optimizing_hardswish_for_edgetpu:
-        print(f'{Color.RED}ERROR:{Color.RESET} optimizing_for_openvino_and_myriad and optimizing_hardswish_for_edgetpu cannot be True at the same time.')
+    if optimizing_for_openvino_and_myriad and optimizing_for_edgetpu:
+        print(f'{Color.RED}ERROR:{Color.RESET} optimizing_for_openvino_and_myriad and optimizing_for_edgetpu cannot be True at the same time.')
+        sys.exit(-1)
+
+    if optimizing_for_openvino_and_myriad and optimizing_for_coreml:
+        print(f'{Color.RED}ERROR:{Color.RESET} optimizing_for_openvino_and_myriad and optimizing_for_coreml cannot be True at the same time.')
+        sys.exit(-1)
+
+    if optimizing_for_edgetpu and optimizing_for_coreml:
+        print(f'{Color.RED}ERROR:{Color.RESET} optimizing_for_edgetpu and optimizing_for_coreml cannot be True at the same time.')
         sys.exit(-1)
 
     if not optimizing_for_openvino_and_myriad and rigorous_optimization_for_myriad:
@@ -5752,7 +5889,10 @@ def main():
             replace_prelu_and_minmax,
             optimizing_for_edgetpu_flg,
             optimizing_for_openvino_and_myriad,
-            rigorous_optimization_for_myriad)
+            rigorous_optimization_for_myriad,
+            optimizing_for_coreml,
+            optimizing_barracuda
+        )
         print('@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@')
         print('outputs:')
         dummy_outputs = []
@@ -5919,6 +6059,7 @@ def main():
             try:
                 print(f'{Color.REVERCE}Dynamic Range Quantization started{Color.RESET}', '=' * 50)
                 converter = tf.lite.TFLiteConverter.from_saved_model(model_output_path)
+                converter._experimental_disable_per_channel = not use_per_channel
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
                 converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS]
                 tflite_model = converter.convert()
@@ -5935,6 +6076,7 @@ def main():
             try:
                 print(f'{Color.REVERCE}Weight Quantization started{Color.RESET}', '=' * 57)
                 converter = tf.lite.TFLiteConverter.from_saved_model(model_output_path)
+                converter._experimental_disable_per_channel = not use_per_channel
                 converter.optimizations = [tf.lite.Optimize.OPTIMIZE_FOR_SIZE]
                 converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS, tf.lite.OpsSet.SELECT_TF_OPS]
                 tflite_model = converter.convert()
@@ -6050,6 +6192,7 @@ def main():
                 print(f'{Color.REVERCE}Integer Quantization started{Color.RESET}', '=' * 56)
                 converter = tf.lite.TFLiteConverter.from_saved_model(model_output_path)
                 converter.experimental_new_quantizer = use_experimental_new_quantizer
+                converter._experimental_disable_per_channel = not use_per_channel
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
                 converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8, tf.lite.OpsSet.SELECT_TF_OPS]
                 tflite_model = None
@@ -6079,6 +6222,7 @@ def main():
                 print(f'{Color.REVERCE}Full Integer Quantization started{Color.RESET}', '=' * 51)
                 converter = tf.lite.TFLiteConverter.from_saved_model(model_output_path)
                 converter.experimental_new_quantizer = use_experimental_new_quantizer
+                converter._experimental_disable_per_channel = not use_per_channel
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
                 converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8, tf.lite.OpsSet.SELECT_TF_OPS]
                 inf_type = None
@@ -6265,18 +6409,45 @@ def main():
             import subprocess
             try:
                 print(f'{Color.REVERCE}ONNX convertion started{Color.RESET}', '=' * 61)
+                loaded = tf.saved_model.load(model_output_path).signatures['serving_default']
+                inputs = ",".join(map(str, [inp.name for inp in loaded.inputs if 'unknown' not in inp.name])).rstrip(',')
                 try:
-                    loaded = tf.saved_model.load(model_output_path).signatures['serving_default']
-                    inputs = ",".join(map(str, [inp.name for inp in loaded.inputs if 'unknown' not in inp.name]))
-                    result = subprocess.check_output(
+                    onnx_convert_command = None
+                    if not onnx_extra_opset:
+                        onnx_convert_command = \
                         [
                             'python3',
                             '-m', 'tf2onnx.convert',
                             '--saved-model', model_output_path,
                             '--opset', str(onnx_opset),
                             '--output', f'{model_output_path}/model_float32.onnx',
-                            '--inputs-as-nchw', f'{inputs}'
-                        ],
+                        ]
+                        if use_onnx_nchw_conversion:
+                            onnx_convert_command.append(
+                                '--inputs-as-nchw'
+                            )
+                            onnx_convert_command.append(
+                                f'{inputs}'
+                            )
+                    else:
+                        onnx_convert_command = \
+                        [
+                            'python3',
+                            '-m', 'tf2onnx.convert',
+                            '--saved-model', model_output_path,
+                            '--opset', str(onnx_opset),
+                            '--output', f'{model_output_path}/model_float32.onnx',
+                            '--extra_opset', onnx_extra_opset,
+                        ]
+                        if use_onnx_nchw_conversion:
+                            onnx_convert_command.append(
+                                '--inputs-as-nchw'
+                            )
+                            onnx_convert_command.append(
+                                f'{inputs}'
+                            )
+                    result = subprocess.check_output(
+                        onnx_convert_command,
                         stderr=subprocess.PIPE
                     ).decode('utf-8')
                     try:
@@ -6289,14 +6460,28 @@ def main():
                         traceback.print_exc()
                     print(result)
                 except:
-                    result = subprocess.check_output(
+                    onnx_convert_command = None
+                    if not onnx_extra_opset:
+                        onnx_convert_command = \
                         [
                             'python3',
                             '-m', 'tf2onnx.convert',
                             '--saved-model', model_output_path,
                             '--opset', str(onnx_opset),
                             '--output', f'{model_output_path}/model_float32.onnx'
-                        ],
+                        ]
+                    else:
+                        onnx_convert_command = \
+                        [
+                            'python3',
+                            '-m', 'tf2onnx.convert',
+                            '--saved-model', model_output_path,
+                            '--opset', str(onnx_opset),
+                            '--output', f'{model_output_path}/model_float32.onnx',
+                            '--extra_opset', onnx_extra_opset
+                        ]
+                    result = subprocess.check_output(
+                        onnx_convert_command,
                         stderr=subprocess.PIPE
                     ).decode('utf-8')
                     try:
